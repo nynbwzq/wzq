@@ -7,9 +7,9 @@ RUN sed -i 's@//.*archive.ubuntu.com@//mirrors.tuna.tsinghua.edu.cn@g' /etc/apt/
 # 防止安装时弹出交互界面卡住
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 2. 安装依赖 (24.04自带的cmake就是新版，直接过)
+# 2. 核心修改：显式加上 make 和 build-essential
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    g++ gcc cmake libelf-dev ca-certificates wget unzip && \
+    build-essential make cmake libelf-dev ca-certificates wget unzip && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,7 +20,7 @@ RUN gcc -shared -fPIC -o liblog.so fake_android.c && \
     gcc -shared -fPIC -o libandroid.so fake_android.c && \
     g++ -std=c++17 -o server server.cpp -ldl
 
-# 4. 下载并编译 termux-elf-cleaner 洗掉安卓依赖
+# 4. 下载并编译 termux-elf-cleaner
 RUN wget -q https://github.com/termux/termux-elf-cleaner/archive/refs/heads/master.zip && \
     unzip -q master.zip && \
     cd termux-elf-cleaner-master && \
