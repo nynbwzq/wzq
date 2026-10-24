@@ -10,8 +10,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <cstdlib>
-#include <thread>
-#include <mutex>
+#include <vector>
 using namespace std;
 
 typedef void* JNIEnv; typedef void* jobject; typedef void* jmethodID; typedef int jint; typedef int* jintArray;
@@ -28,9 +27,6 @@ TEFACES_t TEFACES = nullptr;
 int chessList[227] = {0};
 int step_num = 0;
 
-// 互斥锁：防止多个请求同时修改棋盘状态导致崩溃
-mutex engine_mutex;
-
 bool init_engine() {
     setup_fake_jni();
     void* handle = dlopen("./libmmai.so", RTLD_LAZY | RTLD_LOCAL);
@@ -45,7 +41,7 @@ bool init_engine() {
 }
 
 void handle_client(int client_sock) {
-    char buffer[4096] = {0};
+    char buffer[8192] = {0};
     read(client_sock, buffer, sizeof(buffer) - 1);
     string request(buffer);
     string response_body = "Server is running.";
@@ -57,91 +53,88 @@ void handle_client(int client_sock) {
         close(client_sock); return;
     }
 
-    // 加锁保护共享数据 chessList
-    engine_mutex.lock();
-
     if (request.find("GET /new ") != string::npos) {
         step_num = 0; memset(chessList, 0, sizeof(chessList));
         TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x2, 1, 0, 0, chessList);
         response_body = "{\"status\":\"ok\"}";
         content_type = "application/json";
-        engine_mutex.unlock();
-    }
-    else if (request.find("GET /undo ") != string::npos) {
-        if (step_num >= 2) {
-            step_num -= 2;
-            chessList[step_num] = 0;
-            chessList[step_num + 1] = 0;
-        } else {
-            step_num = 0;
-        }
-        response_body = "{\"status\":\"ok\"}";
-        content_type = "application/json";
-        engine_mutex.unlock();
     }
     else if (request.find("GET /move") != string::npos) {
-        int r = 0, c = 0, color = 1;
-        int t_ms = 5000;
+        int color = 1, t_ms = 5000;
+        string list_str = "";
         
-        size_t pos_r = request.find("r="); if(pos_r != string::npos) r = stoi(request.substr(pos_r+2));
-        size_t pos_c = request.find("c="); if(pos_c != string::npos) c = stoi(request.substr(pos_c+2));
         size_t pos_color = request.find("color="); if(pos_color != string::npos) color = stoi(request.substr(pos_color+6));
         size_t pos_time = request.find("time="); if(pos_time != string::npos) t_ms = stoi(request.substr(pos_time+5));
-
-        if (r != -1 && c != -1) {
-            int pos = r * 15 + c;
-            TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x3, color, pos, step_num, chessList);
-            chessList[step_num++] = pos;
+        size_t pos_list = request.find("list="); 
+        if(pos_list != string::npos) {
+            size_t end = request.find("&", pos_list);
+            list_str = request.substr(pos_list + 5, end == string::npos ? string::npos : end - (pos_list + 5));
         }
 
-        int opp = (color == 1) ? 2 : 1;
+        // 1. 每次请求先清空引擎
+        step_num = 0;
+        memset(chessList, 0, sizeof(chessList));
+        TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x2, 1, 0, 0, chessList);
+
+        // 2. 重演历史记录 (格式: r,c,player,r,c,player...)
+        if (!list_str.empty()) {
+            stringstream ss(list_str);
+            string item;
+            vector<int> tokens;
+            while (getline(ss, item, ',')) {
+                if (!item.empty()) tokens.push_back(stoi(item));
+            }
+            for (size_t i = 0; i + 2 < tokens.size(); i += 3) {
+                int r = tokens[i], c = tokens[i+1], p = tokens[i+2];
+                int pos = r * 15 + c;
+                TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x3, p, pos, step_num, chessList);
+                chessList[step_num++] = pos;
+            }
+        }
+
         int time_sec = t_ms / 1000;
         int actual_time = (time_sec == 0) ? 1 : time_sec; 
 
+        // 3. Fork 计算
+        int pipefd[2];
+        if (pipe(pipefd) == -1) { close(client_sock); return; }
         pid_t pid = fork();
         if (pid == 0) {
-            engine_mutex.unlock(); // 子进程解锁（其实无所谓，子进程独立内存）
-            TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x7, opp, 0, actual_time, chessList);
-            jint res = TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x6, opp, 0, step_num, chessList);
-            string json = "{\"move\":" + to_string(res) + "}";
-            string http_response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + to_string(json.length()) + "\r\n\r\n" + json;
-            write(client_sock, http_response.c_str(), http_response.length());
-            close(client_sock);
+            close(pipefd[0]); 
+            TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x7, color, 0, actual_time, chessList);
+            jint res = TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x6, color, 0, step_num, chessList);
+            write(pipefd[1], &res, sizeof(res));
+            close(pipefd[1]);
             _exit(0);
         } else if (pid > 0) {
-            int max_wait_ms = 15000; 
+            close(pipefd[1]); 
+            int res = -1;
+            int max_wait_ms = actual_time * 1000 + 8000; 
             int waited = 0;
             bool finished = false;
             while (waited < max_wait_ms) {
-                if (waitpid(pid, nullptr, WNOHANG) == pid) {
-                    finished = true; break;
-                }
+                if (waitpid(pid, nullptr, WNOHANG) == pid) { finished = true; break; }
                 usleep(10000); waited += 10;
             }
-            if (!finished) {
-                kill(pid, SIGKILL);
-                waitpid(pid, nullptr, 0);
-                string json = "{\"move\":-1}";
-                string http_response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + to_string(json.length()) + "\r\n\r\n" + json;
-                write(client_sock, http_response.c_str(), http_response.length());
+            if (finished) {
+                read(pipefd[0], &res, sizeof(res));
+            } else {
+                kill(pid, SIGKILL); waitpid(pid, nullptr, 0); res = -1;
             }
-            engine_mutex.unlock();
-            close(client_sock);
-            return;
-        } else {
-            engine_mutex.unlock();
+            close(pipefd[0]);
+            string json = "{\"move\":" + to_string(res) + "}";
+            string http_response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + to_string(json.length()) + "\r\n\r\n" + json;
+            write(client_sock, http_response.c_str(), http_response.length());
+            close(client_sock); return;
         }
-    } else {
-        engine_mutex.unlock();
     }
-
     string http_response = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type + "\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + to_string(response_body.length()) + "\r\n\r\n" + response_body;
     write(client_sock, http_response.c_str(), http_response.length());
     close(client_sock);
 }
 
 int main() {
-    signal(SIGCHLD, SIG_IGN); // 自动回收子进程，防止僵尸
+    signal(SIGCHLD, SIG_IGN); 
     if (!init_engine()) return 1;
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -149,16 +142,18 @@ int main() {
     address.sin_family = AF_INET; address.sin_addr.s_addr = INADDR_ANY; address.sin_port = htons(8080);
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) return 1;
     listen(server_fd, 10);
-    
-    cout << "🚀 服务器成功启动，监听 8080 端口..." << endl;
-
     while (true) {
         int addrlen = sizeof(address);
         int new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
         if (new_socket >= 0) {
-            // 🔥 使用多线程处理请求，主线程永不死锁
-            thread t(handle_client, new_socket);
-            t.detach(); 
+            pid_t pid = fork();
+            if (pid == 0) {
+                close(server_fd);
+                handle_client(new_socket);
+                _exit(0);
+            } else {
+                close(new_socket);
+            }
         }
     }
     return 0;
