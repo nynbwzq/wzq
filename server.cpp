@@ -47,13 +47,15 @@ void handle_client(int client_sock) {
     string response_body = "Server is running.";
     string content_type = "text/plain";
 
+    // 放行 CORS 预检
     if (request.find("OPTIONS ") == 0) {
         string http_response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\n\r\n";
         write(client_sock, http_response.c_str(), http_response.length());
         close(client_sock); return;
     }
 
-    if (request.find("GET /new ") != string::npos) {
+    // 修复 /new 和 /new?wakeup=xxx 的匹配
+    if (request.find("GET /new") != string::npos) {
         step_num = 0; memset(chessList, 0, sizeof(chessList));
         TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x2, 1, 0, 0, chessList);
         response_body = "{\"status\":\"ok\"}";
@@ -71,12 +73,11 @@ void handle_client(int client_sock) {
             list_str = request.substr(pos_list + 5, end == string::npos ? string::npos : end - (pos_list + 5));
         }
 
-        // 1. 每次请求先清空引擎
+        // 每次请求先清空引擎，重演历史记录
         step_num = 0;
         memset(chessList, 0, sizeof(chessList));
         TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x2, 1, 0, 0, chessList);
 
-        // 2. 重演历史记录 (格式: r,c,player,r,c,player...)
         if (!list_str.empty()) {
             stringstream ss(list_str);
             string item;
@@ -90,12 +91,14 @@ void handle_client(int client_sock) {
                 TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x3, p, pos, step_num, chessList);
                 chessList[step_num++] = pos;
             }
+            cout << "✅ 重演完毕，当前步数: " << step_num << endl;
         }
 
         int time_sec = t_ms / 1000;
         int actual_time = (time_sec == 0) ? 1 : time_sec; 
+        // 为了防止 502，把最大思考时间强行限制在 10 秒，防止网关超时
+        if (actual_time > 10) actual_time = 10;
 
-        // 3. Fork 计算
         int pipefd[2];
         if (pipe(pipefd) == -1) { close(client_sock); return; }
         pid_t pid = fork();
@@ -109,19 +112,13 @@ void handle_client(int client_sock) {
         } else if (pid > 0) {
             close(pipefd[1]); 
             int res = -1;
-            int max_wait_ms = actual_time * 1000 + 8000; 
-            int waited = 0;
-            bool finished = false;
-            while (waited < max_wait_ms) {
-                if (waitpid(pid, nullptr, WNOHANG) == pid) { finished = true; break; }
-                usleep(10000); waited += 10;
-            }
-            if (finished) {
-                read(pipefd[0], &res, sizeof(res));
-            } else {
-                kill(pid, SIGKILL); waitpid(pid, nullptr, 0); res = -1;
-            }
+            int status;
+            // 这里直接阻塞等待子进程结束，不搞花里胡哨的定时器，防止出现底层 Bug
+            waitpid(pid, &status, 0); 
+            read(pipefd[0], &res, sizeof(res));
             close(pipefd[0]);
+            
+            cout << "🤖 AI 计算完成，落子: " << res << endl;
             string json = "{\"move\":" + to_string(res) + "}";
             string http_response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + to_string(json.length()) + "\r\n\r\n" + json;
             write(client_sock, http_response.c_str(), http_response.length());
@@ -134,7 +131,7 @@ void handle_client(int client_sock) {
 }
 
 int main() {
-    signal(SIGCHLD, SIG_IGN); 
+    // 删除了 signal(SIGCHLD, SIG_IGN); 防止 AWS 底层冲突
     if (!init_engine()) return 1;
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -153,6 +150,7 @@ int main() {
                 _exit(0);
             } else {
                 close(new_socket);
+                waitpid(pid, nullptr, WNOHANG); // 父进程顺手回收一下僵尸进程
             }
         }
     }
