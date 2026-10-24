@@ -10,6 +10,8 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <cstdlib>
+#include <thread>
+#include <mutex>
 using namespace std;
 
 typedef void* JNIEnv; typedef void* jobject; typedef void* jmethodID; typedef int jint; typedef int* jintArray;
@@ -25,6 +27,9 @@ typedef jint (*TEFACES_t)(JNIEnv*, jobject, jint, jint, jint, jint, jintArray);
 TEFACES_t TEFACES = nullptr;
 int chessList[227] = {0};
 int step_num = 0;
+
+// 互斥锁：防止多个请求同时修改棋盘状态导致崩溃
+mutex engine_mutex;
 
 bool init_engine() {
     setup_fake_jni();
@@ -52,11 +57,15 @@ void handle_client(int client_sock) {
         close(client_sock); return;
     }
 
+    // 加锁保护共享数据 chessList
+    engine_mutex.lock();
+
     if (request.find("GET /new ") != string::npos) {
         step_num = 0; memset(chessList, 0, sizeof(chessList));
         TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x2, 1, 0, 0, chessList);
         response_body = "{\"status\":\"ok\"}";
         content_type = "application/json";
+        engine_mutex.unlock();
     }
     else if (request.find("GET /undo ") != string::npos) {
         if (step_num >= 2) {
@@ -68,6 +77,7 @@ void handle_client(int client_sock) {
         }
         response_body = "{\"status\":\"ok\"}";
         content_type = "application/json";
+        engine_mutex.unlock();
     }
     else if (request.find("GET /move") != string::npos) {
         int r = 0, c = 0, color = 1;
@@ -90,6 +100,7 @@ void handle_client(int client_sock) {
 
         pid_t pid = fork();
         if (pid == 0) {
+            engine_mutex.unlock(); // 子进程解锁（其实无所谓，子进程独立内存）
             TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x7, opp, 0, actual_time, chessList);
             jint res = TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x6, opp, 0, step_num, chessList);
             string json = "{\"move\":" + to_string(res) + "}";
@@ -98,8 +109,7 @@ void handle_client(int client_sock) {
             close(client_sock);
             _exit(0);
         } else if (pid > 0) {
-            // 父进程只等最多 20 秒（防止死循环导致网关超时返回502）
-            int max_wait_ms = 20000; 
+            int max_wait_ms = 15000; 
             int waited = 0;
             bool finished = false;
             while (waited < max_wait_ms) {
@@ -115,19 +125,23 @@ void handle_client(int client_sock) {
                 string http_response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + to_string(json.length()) + "\r\n\r\n" + json;
                 write(client_sock, http_response.c_str(), http_response.length());
             }
+            engine_mutex.unlock();
             close(client_sock);
             return;
+        } else {
+            engine_mutex.unlock();
         }
+    } else {
+        engine_mutex.unlock();
     }
+
     string http_response = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type + "\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + to_string(response_body.length()) + "\r\n\r\n" + response_body;
     write(client_sock, http_response.c_str(), http_response.length());
     close(client_sock);
 }
 
 int main() {
-    // 忽略 SIGCHLD 信号，自动回收子进程，防止僵尸进程
-    signal(SIGCHLD, SIG_IGN);
-    
+    signal(SIGCHLD, SIG_IGN); // 自动回收子进程，防止僵尸
     if (!init_engine()) return 1;
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -136,19 +150,15 @@ int main() {
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) return 1;
     listen(server_fd, 10);
     
+    cout << "🚀 服务器成功启动，监听 8080 端口..." << endl;
+
     while (true) {
         int addrlen = sizeof(address);
         int new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
         if (new_socket >= 0) {
-            // 🔥 关键升级：并发多进程，每个请求 fork 一个独立进程
-            pid_t pid = fork();
-            if (pid == 0) {
-                close(server_fd); // 子进程不需要监听 socket
-                handle_client(new_socket);
-                _exit(0);
-            } else {
-                close(new_socket); // 父进程立刻关闭已连接的 socket，去接下一个客
-            }
+            // 🔥 使用多线程处理请求，主线程永不死锁
+            thread t(handle_client, new_socket);
+            t.detach(); 
         }
     }
     return 0;
