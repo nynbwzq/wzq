@@ -22,20 +22,14 @@ RUN wget -q https://github.com/termux/termux-elf-cleaner/archive/refs/heads/mast
     cmake . && make && make install && cd .. && \
     termux-elf-cleaner libmmai.so && \
     apt-get update && apt-get install -y --no-install-recommends patchelf && \
-    echo "===== 诊断 1: libmmai.so 原始 NEEDED =====" && \
-    patchelf --print-needed libmmai.so && \
-    echo "===== 诊断 2: 替换 libc.so -> libc.so.6 =====" && \
     patchelf --replace-needed libc.so libc.so.6 libmmai.so && \
-    echo "===== 诊断 3: 替换后 NEEDED =====" && \
-    patchelf --print-needed libmmai.so && \
-    echo "===== 诊断 4: 设置 RPATH =====" && \
+    patchelf --replace-needed libm.so libm.so.6 libmmai.so && \
+    patchelf --replace-needed libdl.so libdl.so.2 libmmai.so && \
     patchelf --set-rpath '$ORIGIN' libmmai.so && \
+    echo "===== 最终 NEEDED =====" && \
+    patchelf --print-needed libmmai.so && \
+    echo "===== 最终 RPATH =====" && \
     patchelf --print-rpath libmmai.so && \
-    echo "===== 诊断 5: 系统 libc.so 是什么 =====" && \
-    file /lib/aarch64-linux-gnu/libc.so || true && \
-    ls -la /lib/aarch64-linux-gnu/libc.so* && \
-    echo "===== 诊断 6: /app 目录内容 =====" && \
-    ls -la /app && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 8080
