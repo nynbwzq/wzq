@@ -47,19 +47,18 @@ void handle_client(int client_sock) {
     string response_body = "Server is running.";
     string content_type = "text/plain";
 
-    // 放行 CORS 预检
     if (request.find("OPTIONS ") == 0) {
         string http_response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\n\r\n";
         write(client_sock, http_response.c_str(), http_response.length());
         close(client_sock); return;
     }
 
-    // 修复 /new 和 /new?wakeup=xxx 的匹配
     if (request.find("GET /new") != string::npos) {
         step_num = 0; memset(chessList, 0, sizeof(chessList));
         TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x2, 1, 0, 0, chessList);
         response_body = "{\"status\":\"ok\"}";
         content_type = "application/json";
+        cout << "♻️ 重置棋盘" << endl;
     }
     else if (request.find("GET /move") != string::npos) {
         int color = 1, t_ms = 5000;
@@ -73,7 +72,6 @@ void handle_client(int client_sock) {
             list_str = request.substr(pos_list + 5, end == string::npos ? string::npos : end - (pos_list + 5));
         }
 
-        // 每次请求先清空引擎，重演历史记录
         step_num = 0;
         memset(chessList, 0, sizeof(chessList));
         TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x2, 1, 0, 0, chessList);
@@ -96,9 +94,9 @@ void handle_client(int client_sock) {
 
         int time_sec = t_ms / 1000;
         int actual_time = (time_sec == 0) ? 1 : time_sec; 
-        // 为了防止 502，把最大思考时间强行限制在 10 秒，防止网关超时
-        if (actual_time > 10) actual_time = 10;
+        if (actual_time > 5) actual_time = 5; // 强制最多5秒
 
+        // 🔥 核心隔离：用管道通信，Fork 子进程算棋
         int pipefd[2];
         if (pipe(pipefd) == -1) { close(client_sock); return; }
         pid_t pid = fork();
@@ -113,12 +111,11 @@ void handle_client(int client_sock) {
             close(pipefd[1]); 
             int res = -1;
             int status;
-            // 这里直接阻塞等待子进程结束，不搞花里胡哨的定时器，防止出现底层 Bug
             waitpid(pid, &status, 0); 
             read(pipefd[0], &res, sizeof(res));
             close(pipefd[0]);
+            cout << "🤖 AI 返回: " << res << endl;
             
-            cout << "🤖 AI 计算完成，落子: " << res << endl;
             string json = "{\"move\":" + to_string(res) + "}";
             string http_response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + to_string(json.length()) + "\r\n\r\n" + json;
             write(client_sock, http_response.c_str(), http_response.length());
@@ -131,7 +128,7 @@ void handle_client(int client_sock) {
 }
 
 int main() {
-    // 删除了 signal(SIGCHLD, SIG_IGN); 防止 AWS 底层冲突
+    signal(SIGCHLD, SIG_IGN); 
     if (!init_engine()) return 1;
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -139,18 +136,20 @@ int main() {
     address.sin_family = AF_INET; address.sin_addr.s_addr = INADDR_ANY; address.sin_port = htons(8080);
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) return 1;
     listen(server_fd, 10);
+    cout << "🚀 服务器已启动" << endl;
+    
     while (true) {
         int addrlen = sizeof(address);
         int new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
         if (new_socket >= 0) {
+            // 🔥 关键并发：主进程接客后，立刻 fork 子进程去处理 HTTP，主进程继续 listen
             pid_t pid = fork();
             if (pid == 0) {
                 close(server_fd);
                 handle_client(new_socket);
                 _exit(0);
             } else {
-                close(new_socket);
-                waitpid(pid, nullptr, WNOHANG); // 父进程顺手回收一下僵尸进程
+                close(new_socket); // 父进程关闭已连接句柄
             }
         }
     }
