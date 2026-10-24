@@ -37,6 +37,7 @@ bool init_engine() {
     if (!TEFACES) { cout << "❌ 找不到 TEFACES 符号" << endl; return false; }
     if (rap_init) rap_init();
     if (LoadLib) { char path_buf[256]; strcpy(path_buf, "./bg.png"); LoadLib(path_buf); }
+    cout << "✅ 引擎加载成功" << endl;
     return true;
 }
 
@@ -58,7 +59,6 @@ void handle_client(int client_sock) {
         TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x2, 1, 0, 0, chessList);
         response_body = "{\"status\":\"ok\"}";
         content_type = "application/json";
-        cout << "♻️ 重置棋盘" << endl;
     }
     else if (request.find("GET /move") != string::npos) {
         int color = 1, t_ms = 5000;
@@ -89,46 +89,30 @@ void handle_client(int client_sock) {
                 TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x3, p, pos, step_num, chessList);
                 chessList[step_num++] = pos;
             }
-            cout << "✅ 重演完毕，当前步数: " << step_num << endl;
         }
 
         int time_sec = t_ms / 1000;
         int actual_time = (time_sec == 0) ? 1 : time_sec; 
-        if (actual_time > 5) actual_time = 5; // 强制最多5秒
+        if (actual_time > 5) actual_time = 5; // 强制最多 5 秒，防止被网关强杀
 
-        // 🔥 核心隔离：用管道通信，Fork 子进程算棋
-        int pipefd[2];
-        if (pipe(pipefd) == -1) { close(client_sock); return; }
-        pid_t pid = fork();
-        if (pid == 0) {
-            close(pipefd[0]); 
-            TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x7, color, 0, actual_time, chessList);
-            jint res = TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x6, color, 0, step_num, chessList);
-            write(pipefd[1], &res, sizeof(res));
-            close(pipefd[1]);
-            _exit(0);
-        } else if (pid > 0) {
-            close(pipefd[1]); 
-            int res = -1;
-            int status;
-            waitpid(pid, &status, 0); 
-            read(pipefd[0], &res, sizeof(res));
-            close(pipefd[0]);
-            cout << "🤖 AI 返回: " << res << endl;
-            
-            string json = "{\"move\":" + to_string(res) + "}";
-            string http_response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + to_string(json.length()) + "\r\n\r\n" + json;
-            write(client_sock, http_response.c_str(), http_response.length());
-            close(client_sock); return;
-        }
+        cout << "🎮 步数: " << step_num << "，思考: " << actual_time << "s" << endl;
+
+        // ★ 最纯粹的单进程计算（防崩溃终极方案）
+        TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x7, color, 0, actual_time, chessList);
+        jint res = TEFACES((JNIEnv*)&fake_env_ptr, nullptr, 0x6, color, 0, step_num, chessList);
+        
+        cout << "🤖 AI 返回: " << res << endl;
+        string json = "{\"move\":" + to_string(res) + "}";
+        response_body = json;
+        content_type = "application/json";
     }
+    
     string http_response = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type + "\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + to_string(response_body.length()) + "\r\n\r\n" + response_body;
     write(client_sock, http_response.c_str(), http_response.length());
     close(client_sock);
 }
 
 int main() {
-    signal(SIGCHLD, SIG_IGN); 
     if (!init_engine()) return 1;
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -136,21 +120,13 @@ int main() {
     address.sin_family = AF_INET; address.sin_addr.s_addr = INADDR_ANY; address.sin_port = htons(8080);
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) return 1;
     listen(server_fd, 10);
-    cout << "🚀 服务器已启动" << endl;
+    cout << "🚀 稳定版服务器已启动！" << endl;
     
     while (true) {
         int addrlen = sizeof(address);
         int new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
         if (new_socket >= 0) {
-            // 🔥 关键并发：主进程接客后，立刻 fork 子进程去处理 HTTP，主进程继续 listen
-            pid_t pid = fork();
-            if (pid == 0) {
-                close(server_fd);
-                handle_client(new_socket);
-                _exit(0);
-            } else {
-                close(new_socket); // 父进程关闭已连接句柄
-            }
+            handle_client(new_socket);
         }
     }
     return 0;
